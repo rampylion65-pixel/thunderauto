@@ -42,6 +42,12 @@ with db() as c:
  c.execute('CREATE TABLE IF NOT EXISTS thunder_youtube(id INTEGER PRIMARY KEY, token TEXT NOT NULL)')
  c.execute('ALTER TABLE thunder_jobs ADD COLUMN IF NOT EXISTS youtube_id TEXT')
  c.execute('ALTER TABLE thunder_jobs ADD COLUMN IF NOT EXISTS error TEXT')
+with db() as c:
+ c.execute("ALTER TABLE thunder_jobs ADD COLUMN IF NOT EXISTS auto_enabled BOOLEAN NOT NULL DEFAULT FALSE")
+ c.execute("ALTER TABLE thunder_jobs ADD COLUMN IF NOT EXISTS kids BOOLEAN")
+ c.execute("ALTER TABLE thunder_jobs ADD COLUMN IF NOT EXISTS description TEXT DEFAULT ''")
+ c.execute("ALTER TABLE thunder_jobs ADD COLUMN IF NOT EXISTS attempts INTEGER NOT NULL DEFAULT 0")
+ c.execute("ALTER TABLE thunder_jobs ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ")
 def cipher():
  return Fernet(base64.urlsafe_b64encode(hashlib.sha256(app.secret_key.encode()).digest()))
 def flow(state=None):
@@ -60,27 +66,52 @@ def youtube_callback():
  token=cipher().encrypt(f.credentials.to_json().encode()).decode()
  with db() as c: c.execute('INSERT INTO thunder_youtube VALUES(1,%s) ON CONFLICT(id) DO UPDATE SET token=EXCLUDED.token',(token,))
  return redirect('/#accounts')
-@app.post('/youtube/publish/<ident>')
-def youtube_publish(ident):
+def process_job(ident=None, manual=False, kids=None, description=''):
  with db() as c:
-  r=c.execute('SELECT * FROM thunder_jobs WHERE id=%s FOR UPDATE',(ident,)).fetchone()
   t=c.execute('SELECT token FROM thunder_youtube WHERE id=1').fetchone()
-  if not r or r['platform']!='YouTube' or r['status'] not in ('Pending','Due - API not connected') or not t: abort(400,'Job unavailable or account not connected')
-  if not r['file'].startswith('videos/'): abort(400,'Reupload old local video')
-  c.execute("UPDATE thunder_jobs SET status='Uploading' WHERE id=%s",(ident,))
+  if not t: return 'not_connected'
+  if manual:
+   r=c.execute("SELECT * FROM thunder_jobs WHERE id=%s AND platform='YouTube' AND status IN ('Pending','Due - API not connected') AND youtube_id IS NULL FOR UPDATE SKIP LOCKED",(ident,)).fetchone()
+  else:
+   r=c.execute("SELECT * FROM thunder_jobs WHERE platform='YouTube' AND auto_enabled AND kids IS NOT NULL AND status='Pending' AND youtube_id IS NULL AND scheduled<=%s ORDER BY scheduled LIMIT 1 FOR UPDATE SKIP LOCKED",(datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M'),)).fetchone()
+  if not r: return 'no_job'
+  ident=r['id']
+  if not r['file'].startswith('videos/'): return 'old_file'
+  c.execute("UPDATE thunder_jobs SET status='Uploading',attempts=attempts+1,started_at=now() WHERE id=%s",(ident,))
+ submitted=False
  try:
   creds=Credentials.from_authorized_user_info(json.loads(cipher().decrypt(t['token'].encode())))
   with tempfile.TemporaryDirectory() as tmp:
    path=os.path.join(tmp,'video.mp4'); storage().download_file(bucket(),r['file'],path)
-   status={'privacyStatus':'private','selfDeclaredMadeForKids':request.form.get('kids')=='yes'}
-   result=build('youtube','v3',credentials=creds,cache_discovery=False).videos().insert(part='snippet,status',body={'snippet':{'title':r['title'][:100],'description':request.form.get('description','')[:5000],'categoryId':'22'},'status':status},media_body=MediaFileUpload(path,mimetype='video/mp4',resumable=True)).execute()
+   status={'privacyStatus':'private','selfDeclaredMadeForKids':kids if manual else r['kids']}
+   api=build('youtube','v3',credentials=creds,cache_discovery=False)
+   req=api.videos().insert(part='snippet,status',body={'snippet':{'title':r['title'][:100],'description':(description if manual else r['description'] or '')[:5000],'categoryId':'22'},'status':status},media_body=MediaFileUpload(path,mimetype='video/mp4',resumable=True))
+   submitted=True
+   result=req.execute()
   with db() as c: c.execute("UPDATE thunder_jobs SET status='Uploaded private',youtube_id=%s,error=NULL WHERE id=%s",(result['id'],ident))
+  return 'uploaded_private'
  except Exception as e:
   app.logger.warning('YouTube upload failed: %s',type(e).__name__)
-  with db() as c: c.execute("UPDATE thunder_jobs SET status='Needs review',error=%s WHERE id=%s",(type(e).__name__,ident))
+  retry=not submitted and not manual and r['attempts']<2
+  with db() as c: c.execute("UPDATE thunder_jobs SET status=%s,error=%s WHERE id=%s",('Pending' if retry else 'Needs review',type(e).__name__,ident))
+  return 'retry_later' if retry else 'needs_review'
+@app.post('/youtube/publish/<ident>')
+def youtube_publish(ident):
+ if request.form.get('kids') not in ('yes','no'): abort(400,'Choose audience')
+ result=process_job(ident,True,request.form['kids']=='yes',request.form.get('description',''))
+ if result in ('not_connected','no_job','old_file'): abort(400,result)
  return redirect('/#queue')
+@app.post('/scheduler/run')
+def scheduler_run():
+ with db() as c:
+  c.execute("UPDATE thunder_jobs SET status='Needs review',error='Interrupted upload: check YouTube Studio before retry' WHERE status='Uploading' AND started_at < now()-interval '30 minutes'")
+ return {'result':process_job()}
 @app.before_request
 def auth():
+ if request.path=='/scheduler/run':
+  token=os.getenv('SCHEDULER_TOKEN','')
+  if not token or not secrets.compare_digest(request.headers.get('Authorization',''),'Bearer '+token): abort(401)
+  return
  password=os.getenv('ADMIN_PASSWORD')
  if not password: abort(503,'Set ADMIN_PASSWORD before use')
  a=request.authorization
@@ -90,10 +121,15 @@ def home():
  with db() as c:
   rows=c.execute('SELECT * FROM thunder_jobs ORDER BY scheduled').fetchall()
   connected=bool(c.execute('SELECT id FROM thunder_youtube WHERE id=1').fetchone())
- return render_template('index.html',rows=rows, connected=connected, counts={k:sum(r['status']==k for r in rows) for k in ['Pending','Published','Failed']})
+ return render_template('index.html',rows=rows, connected=connected, counts={k:sum(r['status'] in states for r in rows) for k,states in [('Pending',('Pending','Due - API not connected')),('Published',('Uploaded private','Published')),('Failed',('Needs review','Failed'))]})
 @app.post('/upload')
 def upload():
  files=request.files.getlist('video'); title=request.form.get('title','').strip(); platform=request.form['platform']; scheduled=request.form['scheduled']
+ interval=int(request.form.get('interval','0'))
+ if not 0<=interval<=10080: abort(400,'Invalid interval')
+ auto=request.form.get('auto')=='yes' and platform=='YouTube'
+ kids=request.form.get('kids')
+ if auto and kids not in ('yes','no'): abort(400,'Choose audience')
  scheduled=(datetime.strptime(scheduled,'%Y-%m-%dT%H:%M')-timedelta(hours=5,minutes=30)).strftime('%Y-%m-%dT%H:%M')
  if not files or platform not in ('YouTube','Facebook','Instagram') or any(not f.filename.lower().endswith('.mp4') for f in files): abort(400)
  client=storage(); uploaded=[]
@@ -101,11 +137,11 @@ def upload():
   with db() as c:
    c.execute('LOCK TABLE thunder_jobs IN EXCLUSIVE MODE')
    if c.execute('SELECT count(*) AS total FROM thunder_jobs').fetchone()['total']+len(files)>100: abort(400,'Queue full')
-   for f in files:
+   for i,f in enumerate(files):
     ident=uuid.uuid4().hex; name='videos/'+ident+'.mp4'
     uploaded.append(name)
     client.upload_fileobj(f.stream,bucket(),name,ExtraArgs={'ContentType':'video/mp4'})
-    c.execute('INSERT INTO thunder_jobs(id,title,platform,scheduled,file,status) VALUES(%s,%s,%s,%s,%s,%s)',(ident,title or secure_filename(f.filename),platform,scheduled,name,'Pending'))
+    c.execute('INSERT INTO thunder_jobs(id,title,platform,scheduled,file,status,auto_enabled,kids,description) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)',(ident,title or secure_filename(f.filename),platform,(datetime.strptime(scheduled,'%Y-%m-%dT%H:%M')+timedelta(minutes=i*interval)).strftime('%Y-%m-%dT%H:%M'),name,'Pending',auto,kids=='yes' if kids in ('yes','no') else None,request.form.get('description','')[:5000]))
  except Exception:
   for name in uploaded:
    try: client.delete_object(Bucket=bucket(),Key=name)
@@ -133,6 +169,6 @@ def edit(ident):
 def ist(value): return (datetime.strptime(value,'%Y-%m-%dT%H:%M')+timedelta(hours=5,minutes=30)).strftime('%Y-%m-%dT%H:%M')
 @app.post('/check')
 def check():
- with db() as c: c.execute("UPDATE thunder_jobs SET status='Due - API not connected' WHERE status='Pending' AND scheduled<=%s",(datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M'),))
+ with db() as c: c.execute("UPDATE thunder_jobs SET status='Due - API not connected' WHERE status='Pending' AND NOT auto_enabled AND scheduled<=%s",(datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M'),))
  return redirect('/')
 if __name__=='__main__': app.run(port=int(os.getenv('PORT','5000')))
