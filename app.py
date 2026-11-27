@@ -1,6 +1,6 @@
 import os, uuid
 import requests
-from smart import schedule, metadata, IST
+from smart import schedule, metadata, IST, norm
 from urllib.parse import urlencode, urlparse
 import boto3
 from botocore.config import Config
@@ -61,6 +61,11 @@ with db() as c:
 with db() as c:
  c.execute("CREATE TABLE IF NOT EXISTS thunder_facebook(profile_id TEXT PRIMARY KEY REFERENCES thunder_profiles(id), page_id TEXT NOT NULL, page_name TEXT NOT NULL, token TEXT NOT NULL)")
  c.execute("ALTER TABLE thunder_jobs ADD COLUMN IF NOT EXISTS facebook_id TEXT")
+
+with db() as c:
+ c.execute('CREATE TABLE IF NOT EXISTS thunder_title_memory(key TEXT PRIMARY KEY)')
+ c.execute('CREATE TABLE IF NOT EXISTS thunder_knowledge(topic TEXT,phrase TEXT,PRIMARY KEY(topic,phrase))')
+ c.execute('CREATE TABLE IF NOT EXISTS thunder_drafts(id TEXT PRIMARY KEY,profile_id TEXT NOT NULL,file TEXT NOT NULL,name TEXT NOT NULL,committed BOOLEAN DEFAULT FALSE,created TIMESTAMPTZ DEFAULT now())')
 
 def graph(path, method='GET', token=None, **kwargs):
  version=os.getenv('META_GRAPH_VERSION','v24.0')
@@ -266,49 +271,76 @@ def home():
  return render_template('index.html',facebook=facebook,rows=rows, connected=connected, profiles=profiles, active=active, counts={k:sum(r['status'] in states for r in rows) for k,states in [('Pending',('Pending','Due - API not connected')),('Published',('Uploaded public','Published')),('Failed',('Needs review','Failed'))]})
 @app.post('/smart/preview')
 def smart_preview():
- profile_id()
+ profile=profile_id()
  try:
-  names=json.loads(request.form['names']); topic=request.form['topic'].strip(); daily=int(request.form['daily'])
-  if not topic or len(topic)>300 or not isinstance(names,list) or not 1<=len(names)<=100 or any(not isinstance(n,str) or len(n)>255 for n in names): raise ValueError('Invalid topic or files')
-  dates=schedule(len(names),daily,request.form['start'])
-  items=metadata(topic,names,request.form.get('language','English'))
+  names=json.loads(request.form['names']); topic=request.form['topic']; daily=int(request.form['daily']); mode=request.form.get('mode','continue')
+  if mode not in ('continue','new','instant','gaps') or not isinstance(names,list) or not 1<=len(names)<=100: raise ValueError('Invalid batch')
+  with db() as c:
+   used={r['key'] for r in c.execute('SELECT key FROM thunder_title_memory').fetchall()}
+   used.update(norm(r['title']) for r in c.execute('SELECT title FROM thunder_jobs').fetchall())
+   extra=[r['phrase'] for r in c.execute('SELECT phrase FROM thunder_knowledge WHERE topic=%s',(norm(topic),)).fetchall()]
+   occupied=[datetime.fromisoformat(r['scheduled']).replace(tzinfo=timezone.utc).astimezone(IST) for r in c.execute("SELECT DISTINCT scheduled FROM thunder_jobs WHERE profile_id=%s AND status IN ('Pending','Uploading','Due - API not connected')",(profile,)).fetchall()]
+  dates=schedule(len(names),daily,request.form['start'],occupied=occupied,mode=mode)
+  items=metadata(topic,names,request.form.get('language','English'),used,extra)
   for item,date in zip(items,dates): item['scheduled']=date
   return {'items':items}
  except ValueError as e: return {'error':str(e)},400
- except Exception: return {'error':'AI service unavailable; check API key, model and billing'},502
-
+@app.post('/smart/knowledge')
+def smart_knowledge():
+ profile_id(); topic=norm(request.form.get('topic','')); phrases=request.form.get('phrases','').splitlines()
+ if not topic or len(topic)>100 or len(phrases)>500: abort(400)
+ with db() as c:
+  for phrase in phrases:
+   phrase=phrase.strip()
+   if 1<=len(phrase)<=60: c.execute('INSERT INTO thunder_knowledge VALUES(%s,%s) ON CONFLICT DO NOTHING',(topic,phrase))
+ return {'ok':True}
+@app.post('/smart/stage')
+def smart_stage():
+ profile=profile_id(); ident=request.form.get('id',''); f=request.files.get('video')
+ if not f or not f.filename.lower().endswith('.mp4') or len(ident)!=32 or any(x not in '0123456789abcdef' for x in ident): abort(400)
+ key='videos/'+ident+'.mp4'
+ with db() as c:
+  c.execute('SELECT pg_advisory_xact_lock(hashtext(%s))',(ident,))
+  r=c.execute('SELECT * FROM thunder_drafts WHERE id=%s',(ident,)).fetchone()
+  if r:
+   if r['profile_id']!=profile: abort(403)
+   return {'ok':True}
+  storage().upload_fileobj(f.stream,bucket(),key,ExtraArgs={'ContentType':'video/mp4'})
+  c.execute('INSERT INTO thunder_drafts(id,profile_id,file,name) VALUES(%s,%s,%s,%s)',(ident,profile,key,f.filename[:255]))
+ return {'ok':True}
+@app.get('/smart/drafts')
+def smart_drafts():
+ profile=profile_id()
+ with db() as c: return {'files':c.execute('SELECT id,name FROM thunder_drafts WHERE profile_id=%s AND NOT committed ORDER BY created',(profile,)).fetchall()}
 @app.post('/smart/upload')
 def smart_upload():
- profile=profile_id(); files=request.files.getlist('video'); platforms=request.form.getlist('platform'); kids=request.form.get('kids')
- try: items=json.loads(request.form['items'])
+ profile=profile_id(); platforms=request.form.getlist('platform'); kids=request.form.get('kids'); mode=request.form.get('mode','continue')
+ try: items=json.loads(request.form['items']); ids=json.loads(request.form['ids'])
  except Exception: abort(400,'Invalid metadata')
- if not 1<=len(files)<=100 or len(items)!=len(files) or not platforms or len(set(platforms))!=len(platforms) or any(x not in ('YouTube','Facebook') for x in platforms) or kids not in ('yes','no'): abort(400,'Invalid batch')
- seen=set(); dates=[]
- for f,item in zip(files,items):
-  if not f.filename.lower().endswith('.mp4') or not 1<=len(item['title'].strip())<=99 or len(item['description'])>5000 or item['title'].casefold() in seen: abort(400,'Invalid video metadata')
-  seen.add(item['title'].casefold())
-  date=datetime.fromisoformat(item['scheduled']).replace(tzinfo=IST)
-  if date<=datetime.now(IST): abort(400,'Schedule must be in future')
-  dates.append(date.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M'))
- client=storage(); uploaded=[]
- try:
-  with db() as c:
-   c.execute('LOCK TABLE thunder_jobs IN EXCLUSIVE MODE')
+ if not 1<=len(ids)<=100 or len(set(ids))!=len(ids) or len(items)!=len(ids) or not platforms or len(set(platforms))!=len(platforms) or any(x not in ('YouTube','Facebook') for x in platforms) or kids not in ('yes','no'): abort(400,'Invalid batch')
+ with db() as c:
+  c.execute('LOCK TABLE thunder_jobs IN EXCLUSIVE MODE'); c.execute('LOCK TABLE thunder_title_memory IN EXCLUSIVE MODE')
+  drafts=[c.execute('SELECT * FROM thunder_drafts WHERE id=%s AND profile_id=%s FOR UPDATE',(i,profile)).fetchone() for i in ids]
+  if any(not d for d in drafts): abort(400,'Missing uploaded video')
+  if all(d['committed'] for d in drafts): return {'ok':True,'url':'/?profile='+profile+'#queue'}
+  if any(d['committed'] for d in drafts): abort(409,'Some videos already scheduled')
+  for platform in platforms:
+   table='thunder_connections' if platform=='YouTube' else 'thunder_facebook'
+   if not c.execute('SELECT profile_id FROM '+table+' WHERE profile_id=%s',(profile,)).fetchone(): abort(400,platform+' not connected')
+  used={norm(r['title']) for r in c.execute('SELECT title FROM thunder_jobs').fetchall()}
+  occupied={r['scheduled'] for r in c.execute("SELECT scheduled FROM thunder_jobs WHERE profile_id=%s AND status IN ('Pending','Uploading','Due - API not connected')",(profile,)).fetchall()}
+  for d,item in zip(drafts,items):
+   title=item['title'].strip(); k=norm(title)
+   if not k or len(title)>99 or len(item['description'])>5000 or k in used or not c.execute('INSERT INTO thunder_title_memory VALUES(%s) ON CONFLICT DO NOTHING RETURNING key',(k,)).fetchone(): abort(409,'Duplicate or invalid title; regenerate')
+   used.add(k)
+   date=datetime.fromisoformat(item['scheduled']).replace(tzinfo=IST)
+   if mode=='instant': date=datetime.now(IST)
+   elif date<=datetime.now(IST): abort(409,'Schedule expired; regenerate')
+   utc=date.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M')
+   if mode!='instant' and utc in occupied: abort(409,'Schedule conflict; regenerate')
    for platform in platforms:
-    table='thunder_connections' if platform=='YouTube' else 'thunder_facebook'
-    if not c.execute('SELECT profile_id FROM '+table+' WHERE profile_id=%s',(profile,)).fetchone(): abort(400,platform+' not connected')
-   pending=c.execute("SELECT count(*) AS total FROM thunder_jobs WHERE profile_id=%s AND status IN ('Pending','Uploading','Due - API not connected')",(profile,)).fetchone()['total']
-   if pending+len(files)*len(platforms)>100: abort(400,'Queue limit: 100 platform jobs per profile')
-   for f,item,date in zip(files,items,dates):
-    name='videos/'+uuid.uuid4().hex+'.mp4'; uploaded.append(name)
-    client.upload_fileobj(f.stream,bucket(),name,ExtraArgs={'ContentType':'video/mp4'})
-    for platform in platforms:
-     c.execute('INSERT INTO thunder_jobs(id,title,platform,scheduled,file,status,auto_enabled,kids,description,profile_id) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)',(uuid.uuid4().hex,item['title'],platform,date,name,'Pending',True,kids=='yes',item['description'],profile))
- except Exception:
-  for name in uploaded:
-   try: client.delete_object(Bucket=bucket(),Key=name)
-   except Exception: app.logger.warning('Batch cleanup failed')
-  raise
+    c.execute('INSERT INTO thunder_jobs(id,title,platform,scheduled,file,status,auto_enabled,kids,description,profile_id) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)',(uuid.uuid4().hex,title,platform,utc,d['file'],'Pending',True,kids=='yes',item['description'],profile))
+   c.execute('UPDATE thunder_drafts SET committed=TRUE WHERE id=%s',(d['id'],))
  return {'ok':True,'url':'/?profile='+profile+'#queue'}
 
 @app.post('/upload')
