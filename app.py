@@ -274,7 +274,7 @@ def smart_preview():
  profile=profile_id()
  try:
   names=json.loads(request.form['names']); topic=request.form['topic']; daily=int(request.form['daily']); mode=request.form.get('mode','continue')
-  if mode not in ('continue','new','instant','gaps') or not isinstance(names,list) or not 1<=len(names)<=100: raise ValueError('Invalid batch')
+  if mode not in ('continue','new','instant','gaps') or not isinstance(names,list) or not names: raise ValueError('Invalid batch')
   with db() as c:
    used={r['key'] for r in c.execute('SELECT key FROM thunder_title_memory').fetchall()}
    used.update(norm(r['title']) for r in c.execute('SELECT title FROM thunder_jobs').fetchall())
@@ -288,7 +288,7 @@ def smart_preview():
 @app.post('/smart/knowledge')
 def smart_knowledge():
  profile_id(); topic=norm(request.form.get('topic','')); phrases=request.form.get('phrases','').splitlines()
- if not topic or len(topic)>100 or len(phrases)>500: abort(400)
+ if not topic or len(topic)>100: abort(400)
  with db() as c:
   for phrase in phrases:
    phrase=phrase.strip()
@@ -317,7 +317,7 @@ def smart_upload():
  profile=profile_id(); platforms=request.form.getlist('platform'); kids=request.form.get('kids'); mode=request.form.get('mode','continue')
  try: items=json.loads(request.form['items']); ids=json.loads(request.form['ids'])
  except Exception: abort(400,'Invalid metadata')
- if not 1<=len(ids)<=100 or len(set(ids))!=len(ids) or len(items)!=len(ids) or not platforms or len(set(platforms))!=len(platforms) or any(x not in ('YouTube','Facebook') for x in platforms) or kids not in ('yes','no'): abort(400,'Invalid batch')
+ if not ids or len(set(ids))!=len(ids) or len(items)!=len(ids) or not platforms or len(set(platforms))!=len(platforms) or any(x not in ('YouTube','Facebook') for x in platforms) or kids not in ('yes','no'): abort(400,'Invalid batch')
  with db() as c:
   c.execute('LOCK TABLE thunder_jobs IN EXCLUSIVE MODE'); c.execute('LOCK TABLE thunder_title_memory IN EXCLUSIVE MODE')
   drafts=[c.execute('SELECT * FROM thunder_drafts WHERE id=%s AND profile_id=%s FOR UPDATE',(i,profile)).fetchone() for i in ids]
@@ -358,7 +358,6 @@ def upload():
  try:
   with db() as c:
    c.execute('LOCK TABLE thunder_jobs IN EXCLUSIVE MODE')
-   if c.execute('SELECT count(*) AS total FROM thunder_jobs WHERE profile_id=%s AND status IN (\'Pending\',\'Uploading\',\'Due - API not connected\')',(profile,)).fetchone()['total']+len(files)>100: abort(400,'Queue full')
    for i,f in enumerate(files):
     ident=uuid.uuid4().hex; name='videos/'+ident+'.mp4'
     uploaded.append(name)

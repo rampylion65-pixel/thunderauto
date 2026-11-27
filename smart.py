@@ -15,6 +15,12 @@ def metadata(topic,names,language='English',used=(),extra=()):
  for p,a,g in itertools.product(PATTERNS,angles,GOALS):
   t=p.format(topic=topic,angle=a,goal=g)
   if len(t)<=99 and norm(t) not in seen: candidates.append((t,a))
+ # Additional compositional structures, with distinct topic, angle and goal.
+ openings=['A Reflection on','A Guide to','A Closer Look at','Exploring','Understanding','Discovering','Learning About','Considering','Finding Meaning in','A Journey Through','An Introduction to','A Perspective on','Thinking About','Making Sense of','Looking Beyond','Insights into','Lessons in','Reflections on','A Moment for','A Path Through']
+ endings=['in Daily Life','for Everyday Reflection','with a Calm Mind','for Personal Growth','in Practice','for a New Perspective','for Greater Awareness','in Modern Life','for Thoughtful Living','for Deeper Understanding']
+ for lead,a,g,end in itertools.product(openings,angles,GOALS,endings):
+  t=f'{lead} {topic}: {a} and {g} {end}'
+  if len(t)<=99 and norm(t) not in seen: candidates.append((t,a))
  random.shuffle(candidates); out=[]
  for t,a in candidates:
   k=norm(t)
@@ -23,12 +29,13 @@ def metadata(topic,names,language='English',used=(),extra=()):
   if len(out)==len(names): return out
  raise ValueError('Title combinations exhausted. Add more relevant knowledge phrases.')
 def schedule(count,daily,start,now=None,occupied=(),mode='new'):
- if not 1<=daily<=5 or not 1<=count<=100: raise ValueError('Invalid count')
- now=now or datetime.now(IST); day=max(datetime.fromisoformat(start).date(),now.date()); out=[]; occupied=list(occupied)
+ if not 1<=daily<=5 or count<1: raise ValueError('Invalid count')
+ now=now or datetime.now(IST); day=max(datetime.fromisoformat(start).date(),now.date()); out=[]; occupied=list(occupied); by_day={}
+ for x in occupied: by_day.setdefault(x.date(),[]).append(x)
  if mode=='instant': return [now.strftime('%Y-%m-%dT%H:%M')]*count
  if mode=='continue' and occupied: day=max(day,max(occupied).date()+timedelta(days=1))
  while len(out)<count:
-  existing=[x for x in occupied if x.date()==day]; morning=daily//2 if daily>1 else 1
+  existing=by_day.get(day,[]); morning=daily//2 if daily>1 else 1
   slots=[]
   for hour,n in [(6,morning),(17,daily-morning)]:
    existing_n=sum(x.hour==hour for x in existing)
