@@ -83,13 +83,13 @@ def process_job(ident=None, manual=False, kids=None, description=''):
   creds=Credentials.from_authorized_user_info(json.loads(cipher().decrypt(t['token'].encode())))
   with tempfile.TemporaryDirectory() as tmp:
    path=os.path.join(tmp,'video.mp4'); storage().download_file(bucket(),r['file'],path)
-   status={'privacyStatus':'private','selfDeclaredMadeForKids':kids if manual else r['kids']}
+   status={'privacyStatus':'public','selfDeclaredMadeForKids':kids if manual else r['kids']}
    api=build('youtube','v3',credentials=creds,cache_discovery=False)
    req=api.videos().insert(part='snippet,status',body={'snippet':{'title':r['title'][:100],'description':(description if manual else r['description'] or '')[:5000],'categoryId':'22'},'status':status},media_body=MediaFileUpload(path,mimetype='video/mp4',resumable=True))
    submitted=True
    result=req.execute()
-  with db() as c: c.execute("UPDATE thunder_jobs SET status='Uploaded private',youtube_id=%s,error=NULL WHERE id=%s",(result['id'],ident))
-  return 'uploaded_private'
+  with db() as c: c.execute("UPDATE thunder_jobs SET status='Uploaded public',youtube_id=%s,error=NULL WHERE id=%s",(result['id'],ident))
+  return 'uploaded_public'
  except Exception as e:
   app.logger.warning('YouTube upload failed: %s',type(e).__name__)
   retry=not submitted and not manual and r['attempts']<2
@@ -121,7 +121,7 @@ def home():
  with db() as c:
   rows=c.execute('SELECT * FROM thunder_jobs ORDER BY scheduled').fetchall()
   connected=bool(c.execute('SELECT id FROM thunder_youtube WHERE id=1').fetchone())
- return render_template('index.html',rows=rows, connected=connected, counts={k:sum(r['status'] in states for r in rows) for k,states in [('Pending',('Pending','Due - API not connected')),('Published',('Uploaded private','Published')),('Failed',('Needs review','Failed'))]})
+ return render_template('index.html',rows=rows, connected=connected, counts={k:sum(r['status'] in states for r in rows) for k,states in [('Pending',('Pending','Due - API not connected')),('Published',('Uploaded public','Published')),('Failed',('Needs review','Failed'))]})
 @app.post('/upload')
 def upload():
  files=request.files.getlist('video'); title=request.form.get('title','').strip(); platform=request.form['platform']; scheduled=request.form['scheduled']
