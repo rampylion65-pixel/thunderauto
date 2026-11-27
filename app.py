@@ -1,5 +1,6 @@
 import os, uuid
 import requests
+from smart import schedule, metadata, IST
 from urllib.parse import urlencode, urlparse
 import boto3
 from botocore.config import Config
@@ -263,6 +264,53 @@ def home():
  with db() as c:
   facebook=c.execute('SELECT page_id,page_name FROM thunder_facebook WHERE profile_id=%s',(active,)).fetchone()
  return render_template('index.html',facebook=facebook,rows=rows, connected=connected, profiles=profiles, active=active, counts={k:sum(r['status'] in states for r in rows) for k,states in [('Pending',('Pending','Due - API not connected')),('Published',('Uploaded public','Published')),('Failed',('Needs review','Failed'))]})
+@app.post('/smart/preview')
+def smart_preview():
+ profile_id()
+ try:
+  names=json.loads(request.form['names']); topic=request.form['topic'].strip(); daily=int(request.form['daily'])
+  if not topic or len(topic)>300 or not isinstance(names,list) or not 1<=len(names)<=100 or any(not isinstance(n,str) or len(n)>255 for n in names): raise ValueError('Invalid topic or files')
+  dates=schedule(len(names),daily,request.form['start'])
+  items=metadata(topic,names,request.form.get('language','English'))
+  for item,date in zip(items,dates): item['scheduled']=date
+  return {'items':items}
+ except ValueError as e: return {'error':str(e)},400
+ except Exception: return {'error':'AI service unavailable; check API key, model and billing'},502
+
+@app.post('/smart/upload')
+def smart_upload():
+ profile=profile_id(); files=request.files.getlist('video'); platforms=request.form.getlist('platform'); kids=request.form.get('kids')
+ try: items=json.loads(request.form['items'])
+ except Exception: abort(400,'Invalid metadata')
+ if not 1<=len(files)<=100 or len(items)!=len(files) or not platforms or len(set(platforms))!=len(platforms) or any(x not in ('YouTube','Facebook') for x in platforms) or kids not in ('yes','no'): abort(400,'Invalid batch')
+ seen=set(); dates=[]
+ for f,item in zip(files,items):
+  if not f.filename.lower().endswith('.mp4') or not 1<=len(item['title'].strip())<=99 or len(item['description'])>5000 or item['title'].casefold() in seen: abort(400,'Invalid video metadata')
+  seen.add(item['title'].casefold())
+  date=datetime.fromisoformat(item['scheduled']).replace(tzinfo=IST)
+  if date<=datetime.now(IST): abort(400,'Schedule must be in future')
+  dates.append(date.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M'))
+ client=storage(); uploaded=[]
+ try:
+  with db() as c:
+   c.execute('LOCK TABLE thunder_jobs IN EXCLUSIVE MODE')
+   for platform in platforms:
+    table='thunder_connections' if platform=='YouTube' else 'thunder_facebook'
+    if not c.execute('SELECT profile_id FROM '+table+' WHERE profile_id=%s',(profile,)).fetchone(): abort(400,platform+' not connected')
+   pending=c.execute("SELECT count(*) AS total FROM thunder_jobs WHERE profile_id=%s AND status IN ('Pending','Uploading','Due - API not connected')",(profile,)).fetchone()['total']
+   if pending+len(files)*len(platforms)>100: abort(400,'Queue limit: 100 platform jobs per profile')
+   for f,item,date in zip(files,items,dates):
+    name='videos/'+uuid.uuid4().hex+'.mp4'; uploaded.append(name)
+    client.upload_fileobj(f.stream,bucket(),name,ExtraArgs={'ContentType':'video/mp4'})
+    for platform in platforms:
+     c.execute('INSERT INTO thunder_jobs(id,title,platform,scheduled,file,status,auto_enabled,kids,description,profile_id) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)',(uuid.uuid4().hex,item['title'],platform,date,name,'Pending',True,kids=='yes',item['description'],profile))
+ except Exception:
+  for name in uploaded:
+   try: client.delete_object(Bucket=bucket(),Key=name)
+   except Exception: app.logger.warning('Batch cleanup failed')
+  raise
+ return {'ok':True,'url':'/?profile='+profile+'#queue'}
+
 @app.post('/upload')
 def upload():
  profile=profile_id()
@@ -293,12 +341,13 @@ def upload():
 @app.post('/delete/<ident>')
 def delete(ident):
  with db() as c:
+  c.execute('LOCK TABLE thunder_jobs IN EXCLUSIVE MODE')
   r=c.execute("SELECT file FROM thunder_jobs WHERE id=%s AND status <> 'Uploading' FOR UPDATE",(ident,)).fetchone()
   if r:
    c.execute('DELETE FROM thunder_jobs WHERE id=%s',(ident,))
-   if r['file'].startswith('videos/'):
+   if r['file'].startswith('videos/') and not c.execute('SELECT 1 FROM thunder_jobs WHERE file=%s AND NOT file_cleaned',(r['file'],)).fetchone():
     storage().delete_object(Bucket=bucket(),Key=r['file'])
-   else:
+   elif not r['file'].startswith('videos/'):
     try: os.remove(os.path.join(ROOT,os.path.basename(r['file'])))
     except FileNotFoundError: pass
  return back(request.form.get('profile','default'))
@@ -318,9 +367,10 @@ def cleanup():
  ident=profile_id(); mode=request.form.get('mode')
  if mode not in ('files','history'): abort(400)
  with db() as c:
+  c.execute('LOCK TABLE thunder_jobs IN EXCLUSIVE MODE')
   rows=c.execute("SELECT * FROM thunder_jobs WHERE profile_id=%s AND status IN ('Uploaded public','Published') AND (youtube_id IS NOT NULL OR facebook_id IS NOT NULL) FOR UPDATE",(ident,)).fetchall()
   for r in rows:
-   if not r['file_cleaned'] and r['file'].startswith('videos/'):
+   if not r['file_cleaned'] and r['file'].startswith('videos/') and not c.execute('SELECT 1 FROM thunder_jobs WHERE file=%s AND id<>%s AND NOT file_cleaned',(r['file'],r['id'])).fetchone():
     storage().delete_object(Bucket=bucket(),Key=r['file'])
    if mode=='history': c.execute('DELETE FROM thunder_jobs WHERE id=%s',(r['id'],))
    else: c.execute('UPDATE thunder_jobs SET file_cleaned=TRUE WHERE id=%s',(r['id'],))
