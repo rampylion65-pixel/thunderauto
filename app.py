@@ -330,15 +330,25 @@ def smart_preview():
   for item,date in zip(items,dates): item['scheduled']=date
   return {'items':items}
  except ValueError as e: return {'error':str(e)},400
+@app.get('/smart/knowledge')
+def knowledge_read():
+ profile_id(); topic=norm(request.args.get('topic',''))
+ with db() as c:
+  rows=c.execute('SELECT phrase FROM thunder_knowledge WHERE topic=%s ORDER BY phrase',(topic,)).fetchall()
+ return {'phrases':[r['phrase'] for r in rows]}
 @app.post('/smart/knowledge')
 def smart_knowledge():
- profile_id(); topic=norm(request.form.get('topic','')); phrases=request.form.get('phrases','').splitlines()
- if not topic or len(topic)>100: abort(400)
+ profile_id(); name=request.form.get('topic','').strip(); topic=norm(name)
+ phrases=list(dict.fromkeys(x.strip() for x in request.form.get('phrases','').splitlines() if x.strip()))
+ if not topic or len(name)>100 or not phrases: return {'error':'Enter a topic and at least one phrase'},400
+ if any(len(x)>60 for x in phrases): return {'error':'Each phrase must be at most 60 characters'},400
  with db() as c:
+  c.execute('INSERT INTO thunder_topics(id,name) VALUES(%s,%s) ON CONFLICT DO NOTHING',(topic,name))
+  added=0
   for phrase in phrases:
-   phrase=phrase.strip()
-   if 1<=len(phrase)<=60: c.execute('INSERT INTO thunder_knowledge VALUES(%s,%s) ON CONFLICT DO NOTHING',(topic,phrase))
- return {'ok':True}
+   added+=c.execute('INSERT INTO thunder_knowledge VALUES(%s,%s) ON CONFLICT DO NOTHING',(topic,phrase)).rowcount
+  rows=c.execute('SELECT phrase FROM thunder_knowledge WHERE topic=%s ORDER BY phrase',(topic,)).fetchall()
+ return {'ok':True,'added':added,'phrases':[r['phrase'] for r in rows]}
 @app.post('/smart/stage')
 def smart_stage():
  profile=profile_id(); ident=request.form.get('id',''); f=request.files.get('video')
