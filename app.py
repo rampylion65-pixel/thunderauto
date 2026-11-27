@@ -1,4 +1,6 @@
 import os, uuid
+import requests
+from urllib.parse import urlencode, urlparse
 import boto3
 from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
@@ -55,6 +57,110 @@ with db() as c:
  c.execute("INSERT INTO thunder_connections SELECT 'default',token FROM thunder_youtube WHERE id=1 ON CONFLICT DO NOTHING")
  c.execute("ALTER TABLE thunder_jobs ADD COLUMN IF NOT EXISTS profile_id TEXT NOT NULL DEFAULT 'default' REFERENCES thunder_profiles(id)")
  c.execute("ALTER TABLE thunder_jobs ADD COLUMN IF NOT EXISTS file_cleaned BOOLEAN NOT NULL DEFAULT FALSE")
+with db() as c:
+ c.execute("CREATE TABLE IF NOT EXISTS thunder_facebook(profile_id TEXT PRIMARY KEY REFERENCES thunder_profiles(id), page_id TEXT NOT NULL, page_name TEXT NOT NULL, token TEXT NOT NULL)")
+ c.execute("ALTER TABLE thunder_jobs ADD COLUMN IF NOT EXISTS facebook_id TEXT")
+
+def graph(path, method='GET', token=None, **kwargs):
+ version=os.getenv('META_GRAPH_VERSION','v24.0')
+ headers={'Authorization':'Bearer '+token} if token else {}
+ response=requests.request(method,'https://graph.facebook.com/'+version+'/'+path,headers=headers,timeout=30,**kwargs)
+ if not response.ok: raise RuntimeError('Meta API HTTP '+str(response.status_code))
+ return response.json()
+
+@app.get('/oauth/facebook')
+def facebook_connect():
+ ident=profile_id(); state=secrets.token_urlsafe(32)
+ session['fb_state']=state; session['fb_profile']=ident
+ args={'client_id':os.environ['META_APP_ID'],'redirect_uri':os.environ['META_REDIRECT_URI'],'state':state,'response_type':'code'}
+ if os.getenv('META_CONFIG_ID'): args['config_id']=os.environ['META_CONFIG_ID']
+ else: args['scope']='pages_show_list,pages_manage_posts,pages_read_engagement'
+ return redirect('https://www.facebook.com/'+os.getenv('META_GRAPH_VERSION','v24.0')+'/dialog/oauth?'+urlencode(args))
+
+@app.get('/oauth/facebook/callback')
+def facebook_callback():
+ state=session.pop('fb_state',None); ident=session.pop('fb_profile',None)
+ if not state or not ident or not secrets.compare_digest(state,request.args.get('state','')): abort(400,'Invalid OAuth state')
+ if not request.args.get('code'): abort(400,'Facebook authorization declined')
+ try:
+  token=graph('oauth/access_token',params={'client_id':os.environ['META_APP_ID'],'client_secret':os.environ['META_APP_SECRET'],'redirect_uri':os.environ['META_REDIRECT_URI'],'code':request.args['code']})['access_token']
+  token=graph('oauth/access_token',params={'grant_type':'fb_exchange_token','client_id':os.environ['META_APP_ID'],'client_secret':os.environ['META_APP_SECRET'],'fb_exchange_token':token})['access_token']
+  pages=graph('me/accounts',token=token,params={'fields':'id,name,access_token,tasks','limit':100})['data']
+ except Exception: abort(502,'Facebook authorization failed. Check app configuration and permissions.')
+ # Keep tokens server-side in an encrypted database record, never in the session cookie.
+ nonce=secrets.token_urlsafe(24)
+ with db() as c:
+  c.execute("CREATE TABLE IF NOT EXISTS thunder_fb_choices(nonce TEXT PRIMARY KEY, profile_id TEXT NOT NULL, payload TEXT NOT NULL, expires TIMESTAMPTZ NOT NULL)")
+  c.execute("DELETE FROM thunder_fb_choices WHERE expires < now()")
+  c.execute("INSERT INTO thunder_fb_choices VALUES(%s,%s,%s,now()+interval '10 minutes')",(nonce,ident,cipher().encrypt(json.dumps(pages).encode()).decode()))
+ session['fb_choice']=nonce; session.setdefault('csrf',secrets.token_hex(32))
+ return render_template('facebook_pages.html',pages=[{'id':x['id'],'name':x['name']} for x in pages],active=ident)
+
+@app.post('/facebook/select')
+def facebook_select():
+ nonce=session.pop('fb_choice',None); ident=profile_id()
+ with db() as c:
+  row=c.execute('DELETE FROM thunder_fb_choices WHERE nonce=%s AND profile_id=%s AND expires>now() RETURNING payload',(nonce,ident)).fetchone()
+  if not row: abort(400,'Reconnect Facebook')
+  pages=json.loads(cipher().decrypt(row['payload'].encode()))
+  page=next((x for x in pages if x['id']==request.form.get('page_id')),None)
+  if not page or not page.get('access_token'): abort(400,'Invalid Page')
+  c.execute('INSERT INTO thunder_facebook VALUES(%s,%s,%s,%s) ON CONFLICT(profile_id) DO UPDATE SET page_id=EXCLUDED.page_id,page_name=EXCLUDED.page_name,token=EXCLUDED.token',(ident,page['id'],page['name'],cipher().encrypt(page['access_token'].encode()).decode()))
+ return back(ident,'accounts')
+
+@app.post('/facebook/disconnect')
+def facebook_disconnect():
+ ident=profile_id()
+ with db() as c: c.execute('DELETE FROM thunder_facebook WHERE profile_id=%s',(ident,))
+ return back(ident,'accounts')
+
+def process_facebook():
+ with db() as c:
+  r=c.execute("SELECT * FROM thunder_jobs WHERE platform='Facebook' AND auto_enabled AND status='Pending' AND facebook_id IS NULL AND scheduled<=%s AND EXISTS(SELECT 1 FROM thunder_facebook f WHERE f.profile_id=thunder_jobs.profile_id) ORDER BY scheduled LIMIT 1 FOR UPDATE SKIP LOCKED",(datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M'),)).fetchone()
+  if not r: return 'no_job'
+  t=c.execute('SELECT * FROM thunder_facebook WHERE profile_id=%s',(r['profile_id'],)).fetchone()
+  if not t: return 'not_connected'
+  c.execute("UPDATE thunder_jobs SET status='Uploading',attempts=attempts+1,started_at=now() WHERE id=%s",(r['id'],))
+ try:
+  token=cipher().decrypt(t['token'].encode()).decode()
+  path=t['page_id']+'/video_reels'
+  start=graph(path,'POST',token,data={'upload_phase':'start'})
+  vid=start['video_id']; url=start['upload_url']; parsed=urlparse(url)
+  if parsed.scheme!='https' or parsed.hostname!='rupload.facebook.com' or parsed.username or parsed.password: raise RuntimeError('Unexpected upload host')
+  with tempfile.TemporaryDirectory() as tmp:
+   local=os.path.join(tmp,'video.mp4'); storage().download_file(bucket(),r['file'],local)
+   with open(local,'rb') as f:
+    response=requests.post(url,headers={'Authorization':'OAuth '+token,'offset':'0','file_size':str(os.path.getsize(local))},data=f,timeout=120,allow_redirects=False)
+    if not response.ok or not response.json().get('success'): raise RuntimeError('Reel transfer failed')
+  result=graph(path,'POST',token,data={'upload_phase':'finish','video_id':vid,'video_state':'PUBLISHED','description':(r['title']+'\n'+(r['description'] or ''))[:5000]})
+  if not result.get('success'): raise RuntimeError('Reel finish failed')
+  with db() as c: c.execute("UPDATE thunder_jobs SET status='Submitted to Facebook',facebook_id=%s,error=NULL WHERE id=%s",(vid,r['id']))
+  return 'facebook_submitted'
+ except Exception as e:
+  app.logger.warning('Facebook publishing failed: %s',type(e).__name__)
+  with db() as c: c.execute("UPDATE thunder_jobs SET status='Needs review',error='Facebook upload failed; check Page before retry' WHERE id=%s",(r['id'],))
+  return 'needs_review'
+
+@app.post('/facebook/status/<ident>')
+def facebook_status(ident):
+ profile=profile_id()
+ with db() as c:
+  r=c.execute("SELECT facebook_id FROM thunder_jobs WHERE id=%s AND profile_id=%s AND status='Submitted to Facebook'",(ident,profile)).fetchone()
+  t=c.execute('SELECT token FROM thunder_facebook WHERE profile_id=%s',(profile,)).fetchone()
+ if not r or not t: abort(400)
+ try: status=graph(r['facebook_id'],token=cipher().decrypt(t['token'].encode()).decode(),params={'fields':'status'})['status']
+ except Exception: abort(502,'Unable to check Facebook status')
+ phase=status.get('publishing_phase',{}).get('status')
+ if phase=='complete' and status.get('video_status')=='ready':
+  with db() as c: c.execute("UPDATE thunder_jobs SET status='Published' WHERE id=%s AND status='Submitted to Facebook'",(ident,))
+ return back(profile)
+
+@app.get('/privacy')
+@app.get('/terms')
+@app.get('/data-deletion')
+def public_policy():
+ return render_template('policy.html',kind=request.path[1:],contact=os.getenv('POLICY_CONTACT_EMAIL',''))
+
 def profile_id():
  ident=request.values.get('profile','default')
  with db() as c:
@@ -127,10 +233,13 @@ def youtube_publish(ident):
 @app.post('/scheduler/run')
 def scheduler_run():
  with db() as c:
-  c.execute("UPDATE thunder_jobs SET status='Needs review',error='Interrupted upload: check YouTube Studio before retry' WHERE status='Uploading' AND started_at < now()-interval '30 minutes'")
- return {'result':process_job()}
+  c.execute("UPDATE thunder_jobs SET status='Needs review',error='Interrupted upload: check destination platform before retry' WHERE status='Uploading' AND started_at < now()-interval '30 minutes'")
+ result=process_job()
+ if result=='no_job': result=process_facebook()
+ return {'result':result}
 @app.before_request
 def auth():
+ if request.method=='GET' and request.path in ('/privacy','/terms','/data-deletion'): return
  if request.path=='/scheduler/run':
   token=os.getenv('SCHEDULER_TOKEN','')
   if not token or not secrets.compare_digest(request.headers.get('Authorization',''),'Bearer '+token): abort(401)
@@ -151,16 +260,18 @@ def home():
   active=profile_id()
   rows=c.execute('SELECT * FROM thunder_jobs WHERE profile_id=%s ORDER BY scheduled',(active,)).fetchall()
   connected=bool(c.execute('SELECT profile_id FROM thunder_connections WHERE profile_id=%s',(active,)).fetchone())
- return render_template('index.html',rows=rows, connected=connected, profiles=profiles, active=active, counts={k:sum(r['status'] in states for r in rows) for k,states in [('Pending',('Pending','Due - API not connected')),('Published',('Uploaded public','Published')),('Failed',('Needs review','Failed'))]})
+ with db() as c:
+  facebook=c.execute('SELECT page_id,page_name FROM thunder_facebook WHERE profile_id=%s',(active,)).fetchone()
+ return render_template('index.html',facebook=facebook,rows=rows, connected=connected, profiles=profiles, active=active, counts={k:sum(r['status'] in states for r in rows) for k,states in [('Pending',('Pending','Due - API not connected')),('Published',('Uploaded public','Published')),('Failed',('Needs review','Failed'))]})
 @app.post('/upload')
 def upload():
  profile=profile_id()
  files=request.files.getlist('video'); title=request.form.get('title','').strip(); platform=request.form['platform']; scheduled=request.form['scheduled']
  interval=int(request.form.get('interval','0'))
  if not 0<=interval<=10080: abort(400,'Invalid interval')
- auto=request.form.get('auto')=='yes' and platform=='YouTube'
+ auto=request.form.get('auto')=='yes' and platform in ('YouTube','Facebook')
  kids=request.form.get('kids')
- if auto and kids not in ('yes','no'): abort(400,'Choose audience')
+ if auto and platform=='YouTube' and kids not in ('yes','no'): abort(400,'Choose audience')
  scheduled=(datetime.strptime(scheduled,'%Y-%m-%dT%H:%M')-timedelta(hours=5,minutes=30)).strftime('%Y-%m-%dT%H:%M')
  if not files or platform not in ('YouTube','Facebook','Instagram') or any(not f.filename.lower().endswith('.mp4') for f in files): abort(400)
  client=storage(); uploaded=[]
@@ -207,7 +318,7 @@ def cleanup():
  ident=profile_id(); mode=request.form.get('mode')
  if mode not in ('files','history'): abort(400)
  with db() as c:
-  rows=c.execute("SELECT * FROM thunder_jobs WHERE profile_id=%s AND status IN ('Uploaded public','Published') AND youtube_id IS NOT NULL FOR UPDATE",(ident,)).fetchall()
+  rows=c.execute("SELECT * FROM thunder_jobs WHERE profile_id=%s AND status IN ('Uploaded public','Published') AND (youtube_id IS NOT NULL OR facebook_id IS NOT NULL) FOR UPDATE",(ident,)).fetchall()
   for r in rows:
    if not r['file_cleaned'] and r['file'].startswith('videos/'):
     storage().delete_object(Bucket=bucket(),Key=r['file'])
