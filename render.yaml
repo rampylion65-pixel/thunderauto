@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: thunder-auto-publisher
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    envVars:
+      - key: ADMIN_PASSWORD
+        generateValue: true
