@@ -1,6 +1,7 @@
 import os, uuid
 import requests
 from smart import schedule, metadata, IST, norm
+from library import parse_content, choose
 from urllib.parse import urlencode, urlparse
 import boto3
 from botocore.config import Config
@@ -66,6 +67,44 @@ with db() as c:
  c.execute('CREATE TABLE IF NOT EXISTS thunder_title_memory(key TEXT PRIMARY KEY)')
  c.execute('CREATE TABLE IF NOT EXISTS thunder_knowledge(topic TEXT,phrase TEXT,PRIMARY KEY(topic,phrase))')
  c.execute('CREATE TABLE IF NOT EXISTS thunder_drafts(id TEXT PRIMARY KEY,profile_id TEXT NOT NULL,file TEXT NOT NULL,name TEXT NOT NULL,committed BOOLEAN DEFAULT FALSE,created TIMESTAMPTZ DEFAULT now())')
+
+with db() as c:
+ c.execute("CREATE TABLE IF NOT EXISTS thunder_topics(id TEXT PRIMARY KEY,name TEXT NOT NULL,hashtags TEXT NOT NULL DEFAULT '',keywords TEXT NOT NULL DEFAULT '')")
+ c.execute("CREATE TABLE IF NOT EXISTS thunder_topic_titles(topic_id TEXT REFERENCES thunder_topics(id),key TEXT,title TEXT NOT NULL,description TEXT NOT NULL,hashtags TEXT NOT NULL,keywords TEXT NOT NULL,PRIMARY KEY(topic_id,key))")
+ for name,tags,keys in [('Lord Buddha','#LordBuddha #Buddhism #Mindfulness #Shorts','Buddha, mindfulness, wisdom, compassion'),('Lord Hanuman','#LordHanuman #HanumanJi #Bajrangbali #Shorts','Hanuman Ji, devotion, Ram Bhakti, courage')]:
+  c.execute('INSERT INTO thunder_topics VALUES(%s,%s,%s,%s) ON CONFLICT DO NOTHING',(norm(name),name,tags,keys))
+
+@app.get('/topics')
+def topics_list():
+ profile_id()
+ with db() as c:
+  rows=c.execute("SELECT t.*, (SELECT count(*) FROM thunder_topic_titles l WHERE l.topic_id=t.id) AS total,(SELECT count(*) FROM thunder_topic_titles l WHERE l.topic_id=t.id AND EXISTS(SELECT 1 FROM thunder_title_memory m WHERE m.key=l.key)) AS used FROM thunder_topics t ORDER BY name").fetchall()
+ return {'topics':rows}
+@app.post('/topics/save')
+def topics_save():
+ profile_id(); name=request.form.get('name','').strip(); tags=request.form.get('hashtags','').strip(); keys=request.form.get('keywords','').strip()
+ if not norm(name) or len(name)>60 or len(tags)>400 or len(keys)>1000: return {'error':'Invalid topic or metadata length'},400
+ with db() as c: c.execute('INSERT INTO thunder_topics VALUES(%s,%s,%s,%s) ON CONFLICT(id) DO UPDATE SET hashtags=EXCLUDED.hashtags,keywords=EXCLUDED.keywords',(norm(name),name,tags,keys))
+ return {'ok':True}
+@app.post('/topics/import')
+def topics_import():
+ profile_id(); tid=request.form.get('topic_id','')
+ try: rows=parse_content(request.form.get('content',''),request.form.get('format','txt'))
+ except ValueError as e: return {'error':str(e)},400
+ with db() as c:
+  if not c.execute('SELECT id FROM thunder_topics WHERE id=%s',(tid,)).fetchone(): return {'error':'Unknown topic'},400
+  with c.cursor() as cur: cur.executemany('INSERT INTO thunder_topic_titles VALUES(%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING',[(tid,k,*v) for k,v in rows.items()]); added=cur.rowcount
+ return {'added':added}
+@app.get('/topics/titles')
+def topics_titles():
+ profile_id(); tid=request.args.get('topic_id',''); offset=max(0,request.args.get('offset',0,type=int))
+ with db() as c: rows=c.execute('SELECT l.*,EXISTS(SELECT 1 FROM thunder_title_memory m WHERE m.key=l.key) AS used FROM thunder_topic_titles l WHERE topic_id=%s ORDER BY key LIMIT 100 OFFSET %s',(tid,offset)).fetchall()
+ return {'titles':rows}
+@app.post('/topics/delete-title')
+def topics_delete_title():
+ profile_id()
+ with db() as c: c.execute('DELETE FROM thunder_topic_titles WHERE topic_id=%s AND key=%s',(request.form.get('topic_id'),request.form.get('key')))
+ return {'ok':True}
 
 def graph(path, method='GET', token=None, **kwargs):
  version=os.getenv('META_GRAPH_VERSION','v24.0')
@@ -281,7 +320,13 @@ def smart_preview():
    extra=[r['phrase'] for r in c.execute('SELECT phrase FROM thunder_knowledge WHERE topic=%s',(norm(topic),)).fetchall()]
    occupied=[datetime.fromisoformat(r['scheduled']).replace(tzinfo=timezone.utc).astimezone(IST) for r in c.execute("SELECT DISTINCT scheduled FROM thunder_jobs WHERE profile_id=%s AND status IN ('Pending','Uploading','Due - API not connected')",(profile,)).fetchall()]
   dates=schedule(len(names),daily,request.form['start'],occupied=occupied,mode=mode)
-  items=metadata(topic,names,request.form.get('language','English'),used,extra)
+  content_mode=request.form.get('content_mode','hybrid')
+  if content_mode not in ('hybrid','library','internal'): raise ValueError('Invalid content mode')
+  with db() as c:
+   selected=c.execute('SELECT * FROM thunder_topics WHERE id=%s',(norm(topic),)).fetchone()
+   if not selected: raise ValueError('Choose a saved topic')
+   library_rows=c.execute('SELECT * FROM thunder_topic_titles WHERE topic_id=%s ORDER BY key',(selected['id'],)).fetchall() if content_mode!='internal' else []
+  items=choose(selected['name'],names,used,extra,library_rows,selected['hashtags'],selected['keywords'],content_mode)
   for item,date in zip(items,dates): item['scheduled']=date
   return {'items':items}
  except ValueError as e: return {'error':str(e)},400

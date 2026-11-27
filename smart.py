@@ -4,13 +4,14 @@ IST=timezone(timedelta(hours=5,minutes=30))
 def norm(s): return ' '.join(re.findall(r'\w+',unicodedata.normalize('NFKC',s).casefold()))
 PATTERNS=['{topic}: {angle} for {goal}','Exploring {topic} Through {angle}','{angle} and {topic}: A Path to {goal}','Finding {goal} Through {topic}','{topic} and the Art of {angle}','A Reflection on {topic} and {angle}','Discover {angle} with {topic}','{topic}: A Fresh Perspective on {angle}','From {angle} to {goal} with {topic}','Understanding {topic}: {angle} and {goal}']
 BUDDHA=['Mindfulness','Compassion','Inner Peace','Patience','Letting Go','Kindness','Meditation','Self Awareness','Wisdom','Gratitude','Acceptance','Balance','Simplicity','Generosity','Reflection','Non Attachment','Understanding','Calm','Forgiveness','Right Intention']
+HANUMAN=["Devotion","Courage","Faith","Service","Strength","Humility","Loyalty","Ram Bhakti","Selfless Service","Perseverance","Discipline","Hope","Dedication","Fearlessness","Prayer","Compassion","Integrity","Patience","Inner Strength","Surrender"]
 GENERAL=['New Perspectives','Key Ideas','Everyday Insights','Meaningful Details','Fresh Discoveries','Important Themes','Thoughtful Reflections','Interesting Perspectives','Essential Concepts','Practical Insights','Creative Ideas','Useful Observations','Exploring Ideas','Closer Look','Daily Inspiration']
 GOALS=['Everyday Life','Greater Understanding','Personal Growth','A Fresh Perspective','Meaningful Reflection','Daily Inspiration','A Clearer Mind','New Insights','Thoughtful Living','Deeper Awareness']
 def metadata(topic,names,language='English',used=(),extra=()):
  if language!='English': raise ValueError('Internal engine currently supports English only')
  topic=' '.join(topic.split())
  if not 1<=len(topic)<=60: raise ValueError('Topic must be 1–60 characters')
- angles=(BUDDHA if any(x in topic.lower() for x in ['buddha','buddhist','buddhism']) else GENERAL)+list(extra)
+ angles=(BUDDHA if any(x in topic.lower() for x in ['buddha','buddhist','buddhism']) else HANUMAN if any(x in topic.lower() for x in ["hanuman","bajrangbali"]) else GENERAL)+list(extra)
  seen=set(used); candidates=[]
  for p,a,g in itertools.product(PATTERNS,angles,GOALS):
   t=p.format(topic=topic,angle=a,goal=g)
