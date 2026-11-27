@@ -1,0 +1,20 @@
+name: Thunder scheduler
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+permissions: {}
+concurrency:
+  group: thunder-scheduler
+  cancel-in-progress: false
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Process one due video
+        env:
+          TOKEN: ${{ secrets.SCHEDULER_TOKEN }}
+        run: |
+          test -n "$TOKEN"
+          curl --fail --silent --show-error --max-time 420 -X POST -H "Authorization: Bearer $TOKEN" https://thunder-auto-publisher.onrender.com/scheduler/run
